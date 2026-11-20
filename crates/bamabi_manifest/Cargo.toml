@@ -1,0 +1,24 @@
+[package]
+name = "bamabi_manifest"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Zero-Bevy (`#![forbid(unsafe_code)]`) `mod.toml` manifest parser, SemVer validator, and Kahn topological DAG resolver for `bamabi`"
+readme = "README.md"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+bamabi_sys = { workspace = true }
+semver = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

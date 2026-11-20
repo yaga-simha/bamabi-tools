@@ -1,0 +1,498 @@
+//! Guest mod project scaffolding (`cargo bam new`).
+
+use crate::CliError;
+use crate::sdk::{CPP17_HEADER, ZIG_SDK, c99_header};
+use bamabi_manifest::validate_mod_id;
+use clap::ValueEnum;
+use std::fmt;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+/// Supported guest mod implementation languages for `cargo bam new`.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ModLanguage {
+    /// Rust `cdylib` crate using `bamabi_guest`.
+    Rust,
+    /// Strict ISO C99 shared library using `bamabi.h`.
+    C99,
+    /// Strict ISO C++17 shared library using `bamabi.hpp`.
+    Cpp17,
+    /// Zig dynamic library using `bamabi.zig`.
+    Zig,
+}
+
+impl ModLanguage {
+    /// Canonical lowercase identifier written into `mod.toml`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Rust => "rust",
+            Self::C99 => "c99",
+            Self::Cpp17 => "cpp17",
+            Self::Zig => "zig",
+        }
+    }
+}
+
+impl fmt::Display for ModLanguage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+fn validate_mod_name(raw: &str) -> Result<String, CliError> {
+    validate_mod_id(raw).map_err(CliError::InvalidArgument)?;
+    if raw.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+        return Err(CliError::InvalidArgument(format!(
+            "mod name '{raw}' must start with an ASCII letter or '_'"
+        )));
+    }
+    let stem = raw.replace('-', "_");
+    validate_mod_id(&stem).map_err(CliError::InvalidArgument)?;
+    Ok(stem)
+}
+
+/// Default Git repository URL used for `bamabi_guest` in `cargo bam new --lang rust`.
+pub const DEFAULT_GUEST_SDK_GIT_URL: &str = "https://github.com/yaga-simha/bamabi-wire.git";
+
+/// Default Git branch used for `bamabi_guest` in `cargo bam new --lang rust`.
+pub const DEFAULT_GUEST_SDK_GIT_BRANCH: &str = "main";
+
+fn validate_dep_string(raw: &str, flag: &str) -> Result<(), CliError> {
+    if raw.trim().is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "{flag} must not be empty"
+        )));
+    }
+    if raw.chars().any(char::is_control) {
+        return Err(CliError::InvalidArgument(format!(
+            "{flag} must not contain control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn format_guest_sdk_path_dep(path: &Path) -> Result<String, CliError> {
+    let forward = path.to_string_lossy().replace('\\', "/");
+    let clean = forward.strip_prefix("//?/").unwrap_or(&forward);
+    validate_dep_string(clean, "--guest-sdk-path")?;
+    let quoted = toml::Value::String(clean.to_owned()).to_string();
+    Ok(format!(
+        "bamabi_guest = {{ path = {quoted}, features = [\"derive\"] }}"
+    ))
+}
+
+fn format_guest_sdk_git_dep(git_url: &str, branch: &str) -> Result<String, CliError> {
+    let trimmed = git_url.trim();
+    validate_dep_string(trimmed, "--guest-sdk-git")?;
+    validate_dep_string(branch, "guest SDK git branch")?;
+    let quoted_url = toml::Value::String(trimmed.to_owned()).to_string();
+    let quoted_branch = toml::Value::String(branch.to_owned()).to_string();
+    Ok(format!(
+        "bamabi_guest = {{ git = {quoted_url}, branch = {quoted_branch}, features = [\"derive\"] }}"
+    ))
+}
+
+fn resolve_guest_sdk_dep(
+    guest_sdk_path: Option<&Path>,
+    guest_sdk_git: Option<&str>,
+) -> Result<String, CliError> {
+    match (guest_sdk_path, guest_sdk_git) {
+        (Some(_), Some(_)) => Err(CliError::InvalidArgument(
+            "cannot specify both --guest-sdk-path and --guest-sdk-git".to_owned(),
+        )),
+        (Some(path), None) => format_guest_sdk_path_dep(path),
+        (None, Some(url)) => format_guest_sdk_git_dep(url, DEFAULT_GUEST_SDK_GIT_BRANCH),
+        (None, None) => {
+            format_guest_sdk_git_dep(DEFAULT_GUEST_SDK_GIT_URL, DEFAULT_GUEST_SDK_GIT_BRANCH)
+        }
+    }
+}
+
+/// Scaffolds a new buildable `bamabi` guest mod project in `parent_dir/<name>`.
+///
+/// When `guest_sdk_path` is `None`, Rust mods default to [`DEFAULT_GUEST_SDK_GIT_URL`]
+/// (`branch = "main"`). Use [`scaffold_new_mod_with_git`] to override the Git URL.
+pub fn scaffold_new_mod(
+    name: &str,
+    lang: ModLanguage,
+    parent_dir: &Path,
+    guest_sdk_path: Option<&Path>,
+) -> Result<PathBuf, CliError> {
+    scaffold_new_mod_with_git(name, lang, parent_dir, guest_sdk_path, None)
+}
+
+/// Scaffolds a new buildable `bamabi` guest mod project in `parent_dir/<name>` with optional
+/// local path or custom Git URL override for `bamabi_guest`.
+pub fn scaffold_new_mod_with_git(
+    name: &str,
+    lang: ModLanguage,
+    parent_dir: &Path,
+    guest_sdk_path: Option<&Path>,
+    guest_sdk_git: Option<&str>,
+) -> Result<PathBuf, CliError> {
+    let stem = validate_mod_name(name)?;
+    let rust_dep_line = if lang == ModLanguage::Rust {
+        Some(resolve_guest_sdk_dep(guest_sdk_path, guest_sdk_git)?)
+    } else {
+        if let Some(path) = guest_sdk_path {
+            let _ = format_guest_sdk_path_dep(path)?;
+        }
+        if let Some(url) = guest_sdk_git {
+            let _ = format_guest_sdk_git_dep(url, DEFAULT_GUEST_SDK_GIT_BRANCH)?;
+        }
+        None
+    };
+
+    let project_dir = parent_dir.join(name);
+    if project_dir.exists() {
+        return Err(CliError::AlreadyExists(project_dir));
+    }
+
+    fs::create_dir_all(project_dir.join("src"))?;
+
+    let mod_toml = format!(
+        "[mod]\nid = \"{stem}\"\nname = \"{name}\"\nversion = \"0.1.0\"\nabi_version = \"0.3.0\"\nlanguage = \"{}\"\n\n[dependencies]\n",
+        lang.as_str()
+    );
+    fs::write(project_dir.join("mod.toml"), mod_toml)?;
+
+    match lang {
+        ModLanguage::Rust => {
+            let dep_line = rust_dep_line.unwrap_or_default();
+            let cargo_toml = format!(
+                "[package]\nname = \"{stem}\"\nversion = \"0.1.0\"\nedition = \"2024\"\npublish = false\n\n[workspace]\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n{dep_line}\n"
+            );
+            fs::write(project_dir.join("Cargo.toml"), cargo_toml)?;
+
+            let lib_rs = format!(
+                r#"//! `{name}` guest mod (`ABI 0.3.0`).
+
+use bamabi_guest::prelude::*;
+use core::ffi::CStr;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, AbiPod, GuestComponent)]
+#[guest_component(name = "{stem}::Counter")]
+pub struct Counter {{
+    pub ticks: u64,
+}}
+
+#[derive(Default)]
+pub struct ModPlugin;
+
+impl GuestPlugin for ModPlugin {{
+    const NAME: &'static CStr = c"{stem}";
+    const VERSION: &'static CStr = c"0.1.0";
+
+    fn build(&mut self, app: &mut GuestApp<'_>) -> FfiResult {{
+        if let Err(err) = app.register_component::<Counter>() {{
+            return err;
+        }}
+        app.system(c"tick_counter")
+            .query_typed::<&mut Counter>()
+            .schedule(ScheduleId::UPDATE)
+            .build(|ctx| {{
+                ctx.single_query::<&mut Counter>().for_each(|counters| {{
+                    for counter in counters {{
+                        counter.ticks = counter.ticks.saturating_add(1);
+                    }}
+                }})
+            }})
+    }}
+}}
+
+export_mod!(plugin: ModPlugin);
+"#
+            );
+            fs::write(project_dir.join("src").join("lib.rs"), lib_rs)?;
+        }
+        ModLanguage::C99 => {
+            fs::create_dir_all(project_dir.join("include"))?;
+            fs::write(project_dir.join("include").join("bamabi.h"), c99_header())?;
+
+            let mod_c = format!(
+                r#"#include "bamabi.h"
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct ModState {{
+    BamHostApi api;
+}} ModState;
+
+static BamResult heartbeat_cb(BamSystemCtx* sys_ctx, void* user_data) {{
+    (void)sys_ctx;
+    (void)user_data;
+    return BAM_RESULT_OK;
+}}
+
+static const BamManifest MANIFEST = {{
+    (uint32_t)sizeof(BamManifest),
+    BAM_ABI_VERSION,
+    "{stem}",
+    "0.1.0",
+    0u,
+    0u,
+    NULL,
+    NULL
+}};
+
+BAM_EXPORT const BamManifest* bamabi_manifest(void) {{
+    return &MANIFEST;
+}}
+
+BAM_EXPORT BamResult bamabi_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
+) {{
+    if (!api || !load_ctx || !instance_out) {{
+        return BAM_RESULT_NULL_POINTER;
+    }}
+    *instance_out = NULL;
+
+    ModState* state = (ModState*)calloc(1u, sizeof(ModState));
+    if (!state) {{
+        return BAM_RESULT_INTERNAL_ERROR;
+    }}
+
+    BamResult copy_res = bam_host_api_copy_bounded(&state->api, sizeof(state->api), api);
+    if (copy_res != BAM_RESULT_OK) {{
+        free(state);
+        return copy_res;
+    }}
+    if (!state->api.register_system) {{
+        free(state);
+        return BAM_RESULT_NULL_POINTER;
+    }}
+
+    BamSystemDesc sys;
+    memset(&sys, 0, sizeof(sys));
+    sys.struct_size = (uint32_t)sizeof(BamSystemDesc);
+    sys.name = "heartbeat";
+    sys.callback = heartbeat_cb;
+    sys.schedule = BAM_SCHEDULE_UPDATE;
+
+    BamResult res = state->api.register_system(load_ctx, &sys);
+    if (res != BAM_RESULT_OK) {{
+        free(state);
+        return res;
+    }}
+    *instance_out = (BamInstance*)state;
+    return BAM_RESULT_OK;
+}}
+
+BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
+    free(instance);
+}}
+"#
+            );
+            fs::write(project_dir.join("src").join("mod.c"), mod_c)?;
+        }
+        ModLanguage::Cpp17 => {
+            fs::create_dir_all(project_dir.join("include"))?;
+            fs::write(project_dir.join("include").join("bamabi.h"), c99_header())?;
+            fs::write(project_dir.join("include").join("bamabi.hpp"), CPP17_HEADER)?;
+
+            let mod_cpp = format!(
+                r#"#include "bamabi.hpp"
+#include <memory>
+
+namespace {{
+
+constexpr BamManifest kManifest = {{
+    static_cast<uint32_t>(sizeof(BamManifest)),
+    BAM_ABI_VERSION,
+    "{stem}",
+    "0.1.0",
+    0u,
+    0u
+}};
+
+class CppModInstance {{
+public:
+    explicit CppModInstance(const BamHostApi& api) noexcept : api_(api) {{}}
+
+    BamResult init(BamLoadCtx* load_ctx) {{
+        bam::LoadContextView ctx(api_, load_ctx);
+        BamSystemDesc sys{{}};
+        sys.struct_size = static_cast<uint32_t>(sizeof(BamSystemDesc));
+        sys.name = "heartbeat";
+        sys.callback = &CppModInstance::heartbeat_trampoline;
+        sys.user_data = this;
+        sys.schedule = BAM_SCHEDULE_UPDATE;
+        return ctx.register_system(sys);
+    }}
+
+private:
+    static BamResult heartbeat_trampoline(BamSystemCtx*, void*) {{
+        return bam::guard_boundary([]() {{ return BAM_RESULT_OK; }});
+    }}
+
+    BamHostApi api_;
+}};
+
+}} // namespace
+
+BAM_EXPORT const BamManifest* bamabi_manifest(void) {{
+    return &kManifest;
+}}
+
+BAM_EXPORT BamResult bamabi_init(
+    const BamHostApi* api,
+    BamLoadCtx* load_ctx,
+    BamInstance** instance_out
+) {{
+    if (api == nullptr || load_ctx == nullptr || instance_out == nullptr) {{
+        return BAM_RESULT_NULL_POINTER;
+    }}
+    *instance_out = nullptr;
+    return bam::guard_boundary([&]() -> BamResult {{
+        BamHostApi local_api{{}};
+        const BamResult copy_res =
+            bam_host_api_copy_bounded(&local_api, sizeof(local_api), api);
+        if (!bam::is_ok(copy_res)) {{
+            return copy_res;
+        }}
+        auto inst = std::make_unique<CppModInstance>(local_api);
+        BamResult res = inst->init(load_ctx);
+        if (!bam::is_ok(res)) {{
+            return res;
+        }}
+        *instance_out = reinterpret_cast<BamInstance*>(inst.release());
+        return BAM_RESULT_OK;
+    }});
+}}
+
+BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
+    delete reinterpret_cast<CppModInstance*>(instance);
+}}
+"#
+            );
+            fs::write(project_dir.join("src").join("mod.cpp"), mod_cpp)?;
+        }
+        ModLanguage::Zig => {
+            fs::create_dir_all(project_dir.join("include"))?;
+            fs::write(project_dir.join("include").join("bamabi.h"), c99_header())?;
+            fs::write(project_dir.join("include").join("bamabi.zig"), ZIG_SDK)?;
+
+            let build_zig = format!(
+                r#"const std = @import("std");
+
+pub fn build(b: *std.Build) void {{
+    const target = b.standardTargetOptions(.{{}});
+    const optimize = b.standardOptimizeOption(.{{}});
+
+    const translate_c = b.addTranslateC(.{{
+        .root_source_file = b.path("include/bamabi.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }});
+    translate_c.addIncludePath(b.path("include"));
+    const bam_c_mod = translate_c.createModule();
+
+    const bamabi = b.createModule(.{{
+        .root_source_file = b.path("include/bamabi.zig"),
+        .target = target,
+        .optimize = optimize,
+    }});
+    bamabi.addImport("bam_c", bam_c_mod);
+
+    const mod = b.createModule(.{{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }});
+    mod.addImport("bam_c", bam_c_mod);
+    mod.addImport("bamabi", bamabi);
+
+    const lib = b.addLibrary(.{{
+        .linkage = .dynamic,
+        .name = "{stem}",
+        .root_module = mod,
+    }});
+
+    b.installArtifact(lib);
+}}
+"#
+            );
+            fs::write(project_dir.join("build.zig"), build_zig)?;
+
+            let root_zig = format!(
+                r#"const std = @import("std");
+const c = @import("bam_c");
+
+const ZigModInstance = struct {{
+    api: c.BamHostApi,
+}};
+
+const MANIFEST: c.BamManifest = .{{
+    .struct_size = @sizeOf(c.BamManifest),
+    .abi_version = c.BAM_ABI_VERSION,
+    .name = "{stem}",
+    .version = "0.1.0",
+    .flags = 0,
+    .reserved0 = 0,
+    .save_state = null,
+    .restore_state = null,
+}};
+
+fn heartbeatCb(_: ?*c.BamSystemCtx, _: ?*anyopaque) callconv(.c) c.BamResult {{
+    return c.BAM_RESULT_OK;
+}}
+
+pub export fn bamabi_manifest() callconv(.c) *const c.BamManifest {{
+    return &MANIFEST;
+}}
+
+pub export fn bamabi_init(
+    api: ?*const c.BamHostApi,
+    load_ctx: ?*c.BamLoadCtx,
+    instance_out: ?*?*c.BamInstance,
+) callconv(.c) c.BamResult {{
+    const host_api = api orelse return c.BAM_RESULT_NULL_POINTER;
+    const ctx = load_ctx orelse return c.BAM_RESULT_NULL_POINTER;
+    const out = instance_out orelse return c.BAM_RESULT_NULL_POINTER;
+    out.* = null;
+
+    var local_api = std.mem.zeroes(c.BamHostApi);
+    const copy_rc = c.bam_host_api_copy_bounded(&local_api, @sizeOf(c.BamHostApi), host_api);
+    if (copy_rc != c.BAM_RESULT_OK) {{
+        return copy_rc;
+    }}
+    const register_sys = local_api.register_system orelse return c.BAM_RESULT_NULL_POINTER;
+
+    const inst = std.heap.c_allocator.create(ZigModInstance) catch return c.BAM_RESULT_INTERNAL_ERROR;
+    inst.* = .{{ .api = local_api }};
+
+    var sys = std.mem.zeroes(c.BamSystemDesc);
+    sys.struct_size = @sizeOf(c.BamSystemDesc);
+    sys.name = "heartbeat";
+    sys.callback = heartbeatCb;
+    sys.schedule = c.BAM_SCHEDULE_UPDATE;
+
+    const rc = register_sys(ctx, &sys);
+    if (rc != c.BAM_RESULT_OK) {{
+        std.heap.c_allocator.destroy(inst);
+        return rc;
+    }}
+    out.* = @ptrCast(inst);
+    return c.BAM_RESULT_OK;
+}}
+
+pub export fn bamabi_shutdown(instance: ?*c.BamInstance) callconv(.c) void {{
+    const raw = instance orelse return;
+    const inst: *ZigModInstance = @ptrCast(@alignCast(raw));
+    std.heap.c_allocator.destroy(inst);
+}}
+"#
+            );
+            fs::write(project_dir.join("src").join("root.zig"), root_zig)?;
+        }
+    }
+
+    Ok(project_dir)
+}

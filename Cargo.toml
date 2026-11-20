@@ -1,0 +1,50 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/bamabi_trust",
+    "crates/bamabi_manifest",
+    "crates/cargo-bam",
+]
+
+[workspace.package]
+version = "0.3.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+authors = ["bamabi authors"]
+repository = "https://github.com/yaga-simha/bamabi-tools"
+keywords = ["bevy", "ecs", "ffi", "modding", "plugin"]
+categories = ["game-development", "api-bindings"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+improper_ctypes_definitions = "deny"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+ptr_as_ptr = "warn"
+cast_ptr_alignment = "warn"
+transmute_ptr_to_ptr = "warn"
+needless_pass_by_ref_mut = "warn"
+redundant_clone = "warn"
+match_same_arms = "warn"
+
+[workspace.dependencies]
+bamabi_sys = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_sdk_gen = { version = "0.3.0", git = "https://github.com/yaga-simha/bamabi-wire.git", branch = "main" }
+bamabi_trust = { version = "0.3.0", path = "crates/bamabi_trust" }
+bamabi_manifest = { version = "0.3.0", path = "crates/bamabi_manifest" }
+toml = "0.8"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+proptest = "1"
+ssh-key = { version = "0.6.7", default-features = false, features = ["std", "ed25519"] }
+ssh-encoding = { version = "0.2", default-features = false, features = ["std", "pem", "sha2"] }
+signature = { version = "2", default-features = false, features = ["std"] }
+ed25519-dalek = { version = "2", default-features = false }
