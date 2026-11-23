@@ -4,7 +4,7 @@
 use crate::builder::{c_candidates, cxx_candidates, probe_compiler_banner};
 use crate::dag::{self, ValidatedModManifest};
 use crate::{CliError, sdk};
-use bamabi_sys::{ABI_VERSION, BAM_HOST_API_SLOT_COUNT, BamHostApi};
+use bamabi_sys::{ABI_VERSION, BAM_HOST_API_SLOT_COUNT, BamHostApi, offsets};
 use std::collections::BTreeSet;
 use std::env;
 use std::mem::{align_of, size_of};
@@ -39,9 +39,9 @@ pub struct DoctorReport {
     pub abi_version_hex: String,
     /// Detected Rust host target triple (e.g. `"x86_64-pc-windows-msvc"` or `"aarch64-apple-darwin"`).
     pub host_target_triple: String,
-    /// Number of function-pointer slots in [`BamHostApi`] (`68`).
+    /// Number of function-pointer slots in [`BamHostApi`] ([`BAM_HOST_API_SLOT_COUNT`]).
     pub host_api_slots: usize,
-    /// Byte size of [`BamHostApi`] on this target (`552` on 64-bit, `280` on 32-bit).
+    /// Byte size of [`BamHostApi`] on this target ([`offsets::SIZE_64`] on 64-bit, [`offsets::SIZE_32`] on 32-bit).
     pub host_api_size: usize,
     /// Ordered list of diagnostic probes.
     pub tools: Vec<ToolCheck>,
@@ -298,8 +298,8 @@ fn extract_c99_host_api_slots(c99_header: &str) -> Vec<(String, String)> {
 
 fn check_sdk_header_parity() -> ToolCheck {
     let c99_header = sdk::c99_header();
-    let cpp_header = sdk::CPP17_HEADER;
-    let zig_sdk = sdk::ZIG_SDK;
+    let cpp_header = sdk::CPP17_HEADER.as_str();
+    let zig_sdk = sdk::ZIG_SDK.as_str();
     let slots = extract_c99_host_api_slots(&c99_header);
 
     let expected_abi_macro = format!("#define BAM_ABI_VERSION 0x{ABI_VERSION:08X}u");
@@ -314,7 +314,9 @@ fn check_sdk_header_parity() -> ToolCheck {
     if !c99_header.contains("BAM_HOST_API_SLOT_COUNT")
         || !c99_header.contains(&expected_slot_count_macro)
     {
-        issues.push("C99 header missing BAM_HOST_API_SLOT_COUNT=68".to_owned());
+        issues.push(format!(
+            "C99 header missing BAM_HOST_API_SLOT_COUNT={BAM_HOST_API_SLOT_COUNT}"
+        ));
     }
     if !c99_header.contains("BAM_RESTRICT") {
         issues.push("C99 header missing BAM_RESTRICT".to_owned());
@@ -323,7 +325,9 @@ fn check_sdk_header_parity() -> ToolCheck {
         issues.push("C++17 header missing guard or BAM_RESTRICT".to_owned());
     }
     if !zig_sdk.contains(&expected_zig_slot_count) || !zig_sdk.contains("BAM_RESTRICT_QUALIFIER") {
-        issues.push("Zig SDK missing SLOT_COUNT=68 or BAM_RESTRICT_QUALIFIER".to_owned());
+        issues.push(format!(
+            "Zig SDK missing SLOT_COUNT={BAM_HOST_API_SLOT_COUNT} or BAM_RESTRICT_QUALIFIER"
+        ));
     }
     if slots.len() != BAM_HOST_API_SLOT_COUNT {
         issues.push(format!(
@@ -376,7 +380,7 @@ fn check_sdk_header_parity() -> ToolCheck {
     }
 }
 
-/// Inspects Rust target + `ABI 0.3.0` (`0x0003_0000`, 68-slot [`BamHostApi`]) layout,
+/// Inspects Rust target + `ABI 0.3.0` (`0x0003_0000`, [`BAM_HOST_API_SLOT_COUNT`]-slot [`BamHostApi`]) layout,
 /// MSVC/Clang/GCC/C99/C++17/Zig toolchains, and embedded SDK header parity without failing on
 /// optional tools.
 #[must_use]
@@ -388,7 +392,11 @@ pub fn inspect_environment(require_c: bool) -> DoctorReport {
     let host_api_size = size_of::<BamHostApi>();
     let host_api_align = align_of::<BamHostApi>();
     let ptr_size = size_of::<usize>();
-    let expected_host_api_size = 8 + host_api_slots * ptr_size;
+    let expected_host_api_size = match ptr_size {
+        8 => offsets::SIZE_64,
+        4 => offsets::SIZE_32,
+        _ => 8 + host_api_slots * ptr_size,
+    };
 
     let mut tools = Vec::new();
 
@@ -423,9 +431,14 @@ pub fn inspect_environment(require_c: bool) -> DoctorReport {
     }
 
     let abi_layout_ok = ABI_VERSION == 0x0003_0000
-        && host_api_slots == 68
+        && host_api_slots == offsets::SLOT_COUNT
+        && offsets::SIZE_64 == 8 + host_api_slots * 8
+        && offsets::SIZE_32 == 8 + host_api_slots * 4
         && host_api_size == expected_host_api_size
-        && BamHostApi::MIN_V0_3_SIZE == expected_host_api_size
+        && host_api_size == 8 + host_api_slots * ptr_size
+        && BamHostApi::MIN_V0_2_SIZE <= BamHostApi::MIN_V0_3_SIZE
+        && BamHostApi::MIN_V0_3_SIZE <= expected_host_api_size
+        && BamHostApi::MIN_V0_3_SIZE == offsets::MIGRATE_COMPONENT_COLUMN + ptr_size
         && host_api_align == align_of::<usize>();
     tools.push(ToolCheck {
         name: "rust_target_abi".to_owned(),
@@ -582,7 +595,13 @@ mod tests {
         assert!(report.ok);
         assert_eq!(report.host_abi_version, "0.3.0");
         assert_eq!(report.abi_version_hex, "0x00030000");
-        assert_eq!(report.host_api_slots, 68);
+        assert_eq!(report.host_api_slots, BAM_HOST_API_SLOT_COUNT);
+        let expected_size = if cfg!(target_pointer_width = "64") {
+            offsets::SIZE_64
+        } else {
+            offsets::SIZE_32
+        };
+        assert_eq!(report.host_api_size, expected_size);
         assert!(!report.host_target_triple.is_empty());
 
         let abi_check = report
@@ -592,7 +611,12 @@ mod tests {
             .expect("rust_target_abi check must exist");
         assert!(abi_check.available);
         assert!(abi_check.detail.contains("0x00030000"));
-        assert!(abi_check.detail.contains("68-slot BamHostApi"));
+        assert!(
+            abi_check
+                .detail
+                .contains(&format!("{BAM_HOST_API_SLOT_COUNT}-slot BamHostApi"))
+        );
+        assert!(abi_check.detail.contains(&format!("{expected_size} B")));
 
         let sdk_check = report
             .tools
@@ -600,11 +624,9 @@ mod tests {
             .find(|t| t.name == "sdk_headers")
             .expect("sdk_headers check must exist");
         assert!(sdk_check.available);
-        assert!(
-            sdk_check
-                .detail
-                .contains("68/68 BamHostApi slot offsets verified")
-        );
+        assert!(sdk_check.detail.contains(&format!(
+            "{BAM_HOST_API_SLOT_COUNT}/{BAM_HOST_API_SLOT_COUNT} BamHostApi slot offsets verified"
+        )));
 
         assert!(report.tools.iter().any(|t| t.name == "msvc"));
         assert!(report.tools.iter().any(|t| t.name == "clang"));

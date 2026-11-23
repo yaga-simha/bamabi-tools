@@ -72,7 +72,7 @@ dependencies = [
 [[package]]
 name = "bamabi_sdk_gen"
 version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#7a32b7bd329167c8dda82259659b3da54a5ab748"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#433df66cca7388e4d4bae80c649060261612af57"
 dependencies = [
  "bamabi_sys",
 ]
@@ -80,7 +80,7 @@ dependencies = [
 [[package]]
 name = "bamabi_sys"
 version = "0.3.0"
-source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#7a32b7bd329167c8dda82259659b3da54a5ab748"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#433df66cca7388e4d4bae80c649060261612af57"
 
 [[package]]
 name = "bamabi_trust"

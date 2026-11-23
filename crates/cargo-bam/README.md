@@ -38,7 +38,7 @@ bamabi_guest = { git = "https://github.com/yaga-simha/bamabi-wire.git", branch =
 ```
 
 ### `export-sdk` (alias: `header`)
-Export canonical polyglot SDK headers (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`) including `BAM_EXPORT`, `BAM_RESTRICT`, and all 68 `BAM_HOST_API_OFFSET_*` macros:
+Export canonical polyglot SDK headers (`bamabi.h`, `bamabi.hpp`, `bamabi.zig`) including `BAM_EXPORT`, `BAM_RESTRICT`, and all 73 `BAM_HOST_API_OFFSET_*` macros:
 
 ```bash
 cargo bam export-sdk --out ./include
@@ -85,7 +85,7 @@ cargo bam check-mods ./dist
 ```
 
 ### `doctor`
-Inspect host ABI (`0.3.0`, 68-slot `BamHostApi`), Rust target triple (`cargo` / `rustc`), MSVC `cl.exe` (`INCLUDE`/`LIB`/`vswhere.exe` readiness on Windows), Clang, GCC, C++17 toolchains, optional `zig` (`0.14`–`0.16` recommendation), embedded SDK header parity, and optionally validate a mods directory's `mod.toml` DAG health:
+Inspect host ABI (`0.3.0`, 73-slot `BamHostApi`), Rust target triple (`cargo` / `rustc`), MSVC `cl.exe` (`INCLUDE`/`LIB`/`vswhere.exe` readiness on Windows), Clang, GCC, C++17 toolchains, optional `zig` (`0.14`–`0.16` recommendation), embedded SDK header parity, and optionally validate a mods directory's `mod.toml` DAG health:
 
 ```bash
 cargo bam doctor

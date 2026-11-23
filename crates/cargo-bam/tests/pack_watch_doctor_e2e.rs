@@ -786,10 +786,22 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
         "doctor failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
+    let expected_slots_needle = format!("{}-slot BamHostApi", bamabi_sys::BAM_HOST_API_SLOT_COUNT);
+    let expected_size = if cfg!(target_pointer_width = "64") {
+        bamabi_sys::offsets::SIZE_64
+    } else {
+        bamabi_sys::offsets::SIZE_32
+    };
+    let expected_size_needle = format!("{expected_size} B");
+    let expected_verified_needle = format!(
+        "{0}/{0} BamHostApi slot offsets verified",
+        bamabi_sys::BAM_HOST_API_SLOT_COUNT
+    );
     for needle in [
         "0.3.0",
         "0x00030000",
-        "68-slot BamHostApi",
+        expected_slots_needle.as_str(),
+        expected_size_needle.as_str(),
         "[ok] cargo:",
         "[ok] rustc:",
         "[ok] rust_target_abi:",
@@ -799,7 +811,7 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
         "zig:",
         "0.14-0.16",
         "[ok] sdk_headers:",
-        "68/68 BamHostApi slot offsets verified",
+        expected_verified_needle.as_str(),
         "validated_mods: 2 manifest(s) in DAG order (core@1.0.0 -> expansion@1.2.0)",
     ] {
         assert!(

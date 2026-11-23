@@ -293,7 +293,10 @@ BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
         ModLanguage::Cpp17 => {
             fs::create_dir_all(project_dir.join("include"))?;
             fs::write(project_dir.join("include").join("bamabi.h"), c99_header())?;
-            fs::write(project_dir.join("include").join("bamabi.hpp"), CPP17_HEADER)?;
+            fs::write(
+                project_dir.join("include").join("bamabi.hpp"),
+                CPP17_HEADER.as_str(),
+            )?;
 
             let mod_cpp = format!(
                 r#"#include "bamabi.hpp"
@@ -375,7 +378,10 @@ BAM_EXPORT void bamabi_shutdown(BamInstance* instance) {{
         ModLanguage::Zig => {
             fs::create_dir_all(project_dir.join("include"))?;
             fs::write(project_dir.join("include").join("bamabi.h"), c99_header())?;
-            fs::write(project_dir.join("include").join("bamabi.zig"), ZIG_SDK)?;
+            fs::write(
+                project_dir.join("include").join("bamabi.zig"),
+                ZIG_SDK.as_str(),
+            )?;
 
             let build_zig = format!(
                 r#"const std = @import("std");
