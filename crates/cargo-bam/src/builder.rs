@@ -405,7 +405,7 @@ pub(crate) fn c_candidates() -> Vec<String> {
         }
     }
     #[cfg(target_os = "windows")]
-    let defaults = ["clang", "clang-cl", "cl.exe", "cl", "gcc", "cc"];
+    let defaults = ["cl.exe", "cl", "clang", "clang-cl", "gcc", "cc"];
     #[cfg(not(target_os = "windows"))]
     let defaults = ["clang", "gcc", "cc"];
     for cand in defaults {
@@ -425,7 +425,7 @@ pub(crate) fn cxx_candidates() -> Vec<String> {
         }
     }
     #[cfg(target_os = "windows")]
-    let defaults = ["clang++", "clang-cl", "cl.exe", "cl", "g++", "c++"];
+    let defaults = ["cl.exe", "cl", "clang++", "clang-cl", "g++", "c++"];
     #[cfg(not(target_os = "windows"))]
     let defaults = ["clang++", "g++", "c++"];
     for cand in defaults {
@@ -853,6 +853,15 @@ mod tests {
         let cxx_cands = cxx_candidates();
         assert!(cxx_cands.iter().any(|c| c == "clang++"));
         assert!(cxx_cands.iter().any(|c| c == "g++"));
+        #[cfg(target_os = "windows")]
+        {
+            let cl_pos = c_cands.iter().position(|c| c == "cl.exe").unwrap();
+            let clang_pos = c_cands.iter().position(|c| c == "clang").unwrap();
+            assert!(cl_pos < clang_pos);
+            let cxx_cl_pos = cxx_cands.iter().position(|c| c == "cl.exe").unwrap();
+            let cxx_clang_pos = cxx_cands.iter().position(|c| c == "clang++").unwrap();
+            assert!(cxx_cl_pos < cxx_clang_pos);
+        }
     }
 
     #[test]
