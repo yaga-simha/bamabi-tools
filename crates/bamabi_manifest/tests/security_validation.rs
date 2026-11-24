@@ -172,6 +172,9 @@ fn resolve_library_path_rejects_struct_tampering_and_confines_nested_files() {
         language: None,
         dependencies: BTreeMap::new(),
         optional_dependencies: BTreeMap::new(),
+        targets: BTreeMap::new(),
+        build: None,
+        capabilities: None,
         manifest_path: manifest_path.clone(),
     };
     assert!(matches!(
@@ -188,6 +191,9 @@ fn resolve_library_path_rejects_struct_tampering_and_confines_nested_files() {
         language: None,
         dependencies: BTreeMap::new(),
         optional_dependencies: BTreeMap::new(),
+        targets: BTreeMap::new(),
+        build: None,
+        capabilities: None,
         manifest_path,
     };
     assert!(matches!(
@@ -300,4 +306,56 @@ fn from_file_rejects_oversized_manifests() {
 
     let err = ModTomlManifest::from_file(&oversized).unwrap_err();
     assert!(matches!(err, ManifestError::Io { .. }));
+}
+
+#[test]
+fn rejects_unsafe_targets_build_and_capabilities_sections() {
+    // Traversal in `[targets.<triple>].entry`
+    let bad_target_entry = r#"
+[mod]
+id = "ok"
+version = "1.0.0"
+
+[targets.x86_64-unknown-linux-gnu]
+entry = "../escape.so"
+"#;
+    assert!(ModTomlManifest::parse_str(bad_target_entry, "mod/mod.toml").is_err());
+
+    // Traversal in target triple name
+    let bad_triple = r#"
+[mod]
+id = "ok"
+version = "1.0.0"
+
+[targets."../evil"]
+entry = "bin/ok.so"
+"#;
+    assert!(ModTomlManifest::parse_str(bad_triple, "mod/mod.toml").is_err());
+
+    // Invalid target sha256
+    let bad_sha = r#"
+[mod]
+id = "ok"
+version = "1.0.0"
+
+[targets.x86_64-unknown-linux-gnu]
+entry = "bin/ok.so"
+sha256 = "not-a-sha256"
+"#;
+    assert!(ModTomlManifest::parse_str(bad_sha, "mod/mod.toml").is_err());
+
+    // Empty or traversal in `[build]`
+    let bad_build_cmd = "[mod]\nid = \"ok\"\nversion = \"1.0.0\"\n[build]\ncommand = \"   \"\n";
+    assert!(ModTomlManifest::parse_str(bad_build_cmd, "mod/mod.toml").is_err());
+
+    let bad_build_wd = "[mod]\nid = \"ok\"\nversion = \"1.0.0\"\n[build]\ncommand = \"make\"\nworking_dir = \"../outside\"\n";
+    assert!(ModTomlManifest::parse_str(bad_build_wd, "mod/mod.toml").is_err());
+
+    let bad_build_out = "[mod]\nid = \"ok\"\nversion = \"1.0.0\"\n[build]\ncommand = \"make\"\noutput = \"../evil.so\"\n";
+    assert!(ModTomlManifest::parse_str(bad_build_out, "mod/mod.toml").is_err());
+
+    // Invalid capability name with whitespace/control char
+    let bad_cap =
+        "[mod]\nid = \"ok\"\nversion = \"1.0.0\"\n[capabilities]\nrequired = [\"bad cap\"]\n";
+    assert!(ModTomlManifest::parse_str(bad_cap, "mod/mod.toml").is_err());
 }

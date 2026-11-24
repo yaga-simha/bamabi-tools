@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-//! Library implementation for the `cargo-bam` modding CLI toolchain (`ABI 0.3.0`).
+//! Library implementation for the `cargo-bam` modding CLI toolchain (`ABI 0.4.0`), delegating
+//! core build, packaging, compiler discovery, signing, and `notify` watch logic to
+//! [`bamabi_build`].
 //!
 //! Part of Layer 1 (`bamabi-tools`), `cargo-bam` depends strictly on Layer 0
-//! (`bamabi-wire`: [`bamabi_sys`] and [`bamabi_sdk_gen`]) alongside [`bamabi_manifest`] and
-//! [`bamabi_trust`], with zero Bevy dependencies and `#![forbid(unsafe_code)]`.
+//! (`bamabi-wire`: [`bamabi_sys`] and [`bamabi_sdk_gen`]) alongside [`bamabi_manifest`],
+//! [`bamabi_trust`], and [`bamabi_build`], with zero Bevy dependencies and `#![forbid(unsafe_code)]`.
 //!
 //! ## Provided Modules
 //!
@@ -13,11 +15,11 @@
 //!   `https://github.com/yaga-simha/bamabi-wire.git`, or `--guest-sdk-path` / `--guest-sdk-git`),
 //!   ISO C99, C++17, and Zig guest mods.
 //! - [`sdk`]: Polyglot `bamabi.h`, `bamabi.hpp`, and `bamabi.zig` SDK header exporter.
-//! - [`builder`]: Compiler/toolchain discovery and shared-library staging (`cargo bam build`).
+//! - [`builder`]: Compiler/toolchain discovery, `[build] command`, and shared-library staging (`cargo bam build`).
 //! - [`pack`]: Deterministic `.bampack` archive builder and verifier (`cargo bam pack`).
-//! - [`watch`]: Pure-`std` debounced polling rebuild/sign/stage loop (`cargo bam watch`).
+//! - [`watch`]: `notify` event-driven + mtime-gated incremental rebuild/sign/stage loop (`cargo bam watch`).
 //! - [`dag`]: Multi-mod `mod.toml` validation and Kahn topological sorting (`cargo bam check-mods`).
-//! - [`doctor`]: Host ABI `0.3.0` and Rust/C99/C++17/Zig toolchain diagnostics (`cargo bam doctor`).
+//! - [`doctor`]: Host ABI `0.4.0` and Rust/C99/C++17/Zig toolchain diagnostics (`cargo bam doctor`).
 //! - [`signing`]: OpenSSH Ed25519 key generation, detached `.sig` signing, and verification.
 
 pub mod builder;
@@ -29,17 +31,13 @@ pub mod sdk;
 pub mod signing;
 pub mod watch;
 
-use bamabi_manifest::{validate_manifest_entry_path, validate_mod_id};
-use clap::{Parser, Subcommand};
-use dag::ValidatedModManifest;
+use bamabi_build::BuildError;
+use clap::{Parser, Subcommand, ValueEnum};
 use scaffold::ModLanguage;
-use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -66,325 +64,36 @@ pub enum CliError {
     Io(#[from] std::io::Error),
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct ResolvedProject {
-    pub(crate) project_dir: PathBuf,
-    pub(crate) mod_toml_path: Option<PathBuf>,
-    pub(crate) manifest: Option<ValidatedModManifest>,
-    pub(crate) language: ModLanguage,
-    pub(crate) mod_id: String,
-    pub(crate) lib_stem: String,
-}
-
-pub(crate) fn dylib_naming() -> (&'static str, &'static str) {
-    if cfg!(target_os = "windows") {
-        ("", "dll")
-    } else if cfg!(target_os = "macos") {
-        ("lib", "dylib")
-    } else {
-        ("lib", "so")
-    }
-}
-
-/// Reads a regular file from disk bounded by `max_bytes`, failing cleanly on directories/FIFOs
-/// or oversized files.
-pub(crate) fn read_file_bounded(
-    path: &Path,
-    max_bytes: u64,
-    label: &str,
-) -> Result<Vec<u8>, CliError> {
-    let file = fs::File::open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file() {
-        return Err(CliError::InvalidArgument(format!(
-            "{label} '{}' is not a regular file",
-            path.display()
-        )));
-    }
-    if meta.len() > max_bytes {
-        return Err(CliError::InvalidArgument(format!(
-            "{label} '{}' ({} bytes) exceeds limit ({max_bytes} bytes)",
-            path.display(),
-            meta.len()
-        )));
-    }
-    let cap = usize::try_from(meta.len()).unwrap_or(0);
-    let mut buf = Vec::with_capacity(cap);
-    file.take(max_bytes.saturating_add(1))
-        .read_to_end(&mut buf)?;
-    if buf.len() as u64 > max_bytes {
-        return Err(CliError::InvalidArgument(format!(
-            "{label} '{}' exceeded limit ({max_bytes} bytes) while reading",
-            path.display()
-        )));
-    }
-    Ok(buf)
-}
-
-/// Validates `mod_id` and safely creates/verifies `<stage_root>/<mod_id>` without allowing
-/// traversal, unsafe identifiers, symlink escapes, or writes outside `stage_root`.
-pub(crate) fn validated_stage_dir(stage_root: &Path, mod_id: &str) -> Result<PathBuf, CliError> {
-    validate_mod_id(mod_id).map_err(|reason| {
-        CliError::InvalidManifest(format!(
-            "refusing to stage unsafe mod identifier '{mod_id}': {reason}"
-        ))
-    })?;
-
-    if let Ok(meta) = fs::symlink_metadata(stage_root)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::InvalidArgument(format!(
-            "staging root must not be a symlink: {}",
-            stage_root.display()
-        )));
-    }
-    fs::create_dir_all(stage_root)?;
-    let canon_root = fs::canonicalize(stage_root)?;
-
-    let stage_dir = stage_root.join(mod_id);
-    if let Ok(meta) = fs::symlink_metadata(&stage_dir)
-        && meta.file_type().is_symlink()
-    {
-        return Err(CliError::InvalidArgument(format!(
-            "staging directory must not be a symlink: {}",
-            stage_dir.display()
-        )));
-    }
-    fs::create_dir_all(&stage_dir)?;
-    let canon_stage = fs::canonicalize(&stage_dir)?;
-    if !canon_stage.starts_with(&canon_root) || canon_stage == canon_root {
-        return Err(CliError::InvalidManifest(format!(
-            "staging directory '{}' escapes staging root '{}'",
-            canon_stage.display(),
-            canon_root.display()
-        )));
-    }
-    Ok(stage_dir)
-}
-
-#[derive(Deserialize)]
-struct CargoTomlPartial {
-    package: Option<CargoPackagePartial>,
-    lib: Option<CargoLibPartial>,
-}
-
-#[derive(Deserialize)]
-struct CargoPackagePartial {
-    name: String,
-}
-
-#[derive(Deserialize)]
-struct CargoLibPartial {
-    name: Option<String>,
-}
-
-pub(crate) fn detect_rust_crate_stem(cargo_toml: &Path) -> Result<String, CliError> {
-    let raw = read_file_bounded(
-        cargo_toml,
-        bamabi_manifest::MAX_MANIFEST_BYTES,
-        "Cargo.toml",
-    )?;
-    let content = String::from_utf8(raw).map_err(|_| {
-        CliError::InvalidManifest(format!("{} is not valid UTF-8", cargo_toml.display()))
-    })?;
-    let parsed: CargoTomlPartial = toml::from_str(&content)
-        .map_err(|e| CliError::InvalidManifest(format!("{}: {e}", cargo_toml.display())))?;
-    let name = parsed
-        .lib
-        .and_then(|l| l.name)
-        .or_else(|| parsed.package.map(|p| p.name))
-        .ok_or_else(|| {
-            CliError::InvalidManifest(format!(
-                "{} is missing `[package].name`",
-                cargo_toml.display()
-            ))
-        })?;
-    let stem = name.replace('-', "_");
-    validate_mod_id(&stem).map_err(|reason| {
-        CliError::InvalidManifest(format!(
-            "{} has unsafe crate name '{name}': {reason}",
-            cargo_toml.display()
-        ))
-    })?;
-    Ok(stem)
-}
-
-fn parse_language_str(raw: &str) -> Option<ModLanguage> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some(ModLanguage::Rust),
-        "c" | "c99" => Some(ModLanguage::C99),
-        "cpp" | "c++" | "cpp17" | "c++17" => Some(ModLanguage::Cpp17),
-        "zig" => Some(ModLanguage::Zig),
-        _ => None,
-    }
-}
-
-pub(crate) fn resolve_project_info(
-    manifest_path: Option<&Path>,
-    dir: Option<&Path>,
-) -> Result<ResolvedProject, CliError> {
-    let (project_dir, mod_toml_path) = if let Some(mp) = manifest_path {
-        let file_name = mp.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        if file_name == "mod.toml" {
-            let pdir = mp
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            (pdir, Some(mp.to_path_buf()))
-        } else if file_name == "Cargo.toml" {
-            let pdir = mp
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."))
-                .to_path_buf();
-            let candidate = pdir.join("mod.toml");
-            (pdir, candidate.is_file().then_some(candidate))
-        } else {
-            return Err(CliError::InvalidArgument(format!(
-                "--manifest-path must point to `mod.toml` or `Cargo.toml`, got {}",
-                mp.display()
-            )));
+impl From<BuildError> for CliError {
+    fn from(err: BuildError) -> Self {
+        match err {
+            BuildError::InvalidArgument(msg) => Self::InvalidArgument(msg),
+            BuildError::AlreadyExists(path) => Self::AlreadyExists(path),
+            BuildError::InvalidManifest(msg) => Self::InvalidManifest(msg),
+            BuildError::Command(msg) => Self::Command(msg),
+            BuildError::Crypto(msg) => Self::Crypto(msg),
+            BuildError::Io(io) => Self::Io(io),
         }
-    } else {
-        let pdir = dir.unwrap_or_else(|| Path::new(".")).to_path_buf();
-        let candidate = pdir.join("mod.toml");
-        (pdir, candidate.is_file().then_some(candidate))
-    };
-
-    let manifest = if let Some(ref mp) = mod_toml_path {
-        Some(ValidatedModManifest::from_file(mp)?)
-    } else {
-        None
-    };
-
-    let cargo_toml = project_dir.join("Cargo.toml");
-    let explicit_lang = manifest
-        .as_ref()
-        .and_then(|m| m.language.as_deref())
-        .and_then(parse_language_str);
-
-    let language = if let Some(lang) = explicit_lang {
-        lang
-    } else if cargo_toml.is_file() {
-        ModLanguage::Rust
-    } else if project_dir.join("build.zig").is_file() {
-        ModLanguage::Zig
-    } else if project_dir.join("src/mod.cpp").is_file() || project_dir.join("mod.cpp").is_file() {
-        ModLanguage::Cpp17
-    } else if project_dir.join("src/mod.c").is_file() || project_dir.join("mod.c").is_file() {
-        ModLanguage::C99
-    } else {
-        return Err(CliError::InvalidManifest(format!(
-            "could not determine mod language in {} (missing `mod.toml`, `Cargo.toml`, `build.zig`, `src/mod.c`, or `src/mod.cpp`)",
-            project_dir.display()
-        )));
-    };
-
-    let mod_id = match manifest.as_ref() {
-        Some(m) => {
-            validate_mod_id(&m.id).map_err(|reason| {
-                CliError::InvalidManifest(format!("invalid [mod].id '{}': {reason}", m.id))
-            })?;
-            if let Some(ref entry) = m.entry {
-                validate_manifest_entry_path(entry).map_err(|reason| {
-                    CliError::InvalidManifest(format!("invalid [mod].entry '{entry}': {reason}"))
-                })?;
-            }
-            m.id.clone()
-        }
-        None => {
-            let derived = project_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("bam_mod")
-                .to_owned();
-            validate_mod_id(&derived).map_err(|reason| {
-                CliError::InvalidManifest(format!(
-                    "derived mod identifier '{derived}' from '{}' is unsafe: {reason} (add an explicit [mod].id in mod.toml)",
-                    project_dir.display()
-                ))
-            })?;
-            derived
-        }
-    };
-
-    let lib_stem = if language == ModLanguage::Rust && cargo_toml.is_file() {
-        detect_rust_crate_stem(&cargo_toml)?
-    } else {
-        let stem = manifest
-            .as_ref()
-            .and_then(|m| m.entry.clone())
-            .map(|e| {
-                Path::new(&e)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&mod_id)
-                    .trim_start_matches("lib")
-                    .to_owned()
-            })
-            .unwrap_or_else(|| mod_id.clone())
-            .replace('-', "_");
-        validate_mod_id(&stem).map_err(|reason| {
-            CliError::InvalidManifest(format!("derived library stem '{stem}' is unsafe: {reason}"))
-        })?;
-        stem
-    };
-
-    Ok(ResolvedProject {
-        project_dir,
-        mod_toml_path,
-        manifest,
-        language,
-        mod_id,
-        lib_stem,
-    })
+    }
 }
 
-pub(crate) fn atomic_write_bytes(dest: &Path, bytes: &[u8]) -> Result<(), CliError> {
-    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum CliModLanguage {
+    Rust,
+    C99,
+    Cpp17,
+    Zig,
+}
 
-    let parent = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    fs::create_dir_all(parent)?;
-
-    let base_name = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("artifact");
-    let pid = std::process::id();
-
-    let (mut file, tmp_path) = loop {
-        let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        let candidate = parent.join(format!(".{base_name}.bamtmp.{pid}.{seq}"));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(f) => break (f, candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(CliError::Io(err)),
+impl From<CliModLanguage> for ModLanguage {
+    fn from(lang: CliModLanguage) -> Self {
+        match lang {
+            CliModLanguage::Rust => Self::Rust,
+            CliModLanguage::C99 => Self::C99,
+            CliModLanguage::Cpp17 => Self::Cpp17,
+            CliModLanguage::Zig => Self::Zig,
         }
-    };
-
-    let write_res = file
-        .write_all(bytes)
-        .and_then(|()| file.flush())
-        .and_then(|()| file.sync_all());
-    drop(file);
-    if let Err(err) = write_res {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(CliError::Io(err));
     }
-
-    if let Err(err) = fs::rename(&tmp_path, dest) {
-        let _ = fs::remove_file(&tmp_path);
-        return Err(CliError::Io(err));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Parser)]
@@ -406,8 +115,8 @@ enum Commands {
         /// Mod crate/library name.
         name: String,
         /// Target guest implementation language.
-        #[arg(long, value_enum, default_value_t = ModLanguage::Rust)]
-        lang: ModLanguage,
+        #[arg(long, value_enum, default_value_t = CliModLanguage::Rust)]
+        lang: CliModLanguage,
         /// Parent directory in which `<name>` will be created.
         #[arg(long, default_value = ".")]
         dir: PathBuf,
@@ -445,8 +154,11 @@ enum Commands {
         /// `SSHSIG` namespace used when `--sign-key` is passed.
         #[arg(long, default_value = signing::DEFAULT_NAMESPACE)]
         sign_namespace: String,
+        /// Optional target triple for cross-compiled Rust / multi-target builds.
+        #[arg(long)]
+        target: Option<String>,
     },
-    /// Package a guest mod (`mod.toml`, shared library, and optional `assets/`) into a deterministic `.bampack` archive.
+    /// Package a guest mod (`mod.toml`, shared library, optional `[targets.<triple>]`, and `assets/`) into a deterministic `.bampack` archive.
     Pack {
         /// Project directory containing `mod.toml` / `Cargo.toml`.
         #[arg(long)]
@@ -475,8 +187,14 @@ enum Commands {
         /// Skip building and locate an already-built shared library instead.
         #[arg(long)]
         skip_build: bool,
+        /// Explicit multi-target artifact entry (`<target_triple>=<path>`), repeatable.
+        #[arg(long = "target-artifact")]
+        target_artifacts: Vec<String>,
+        /// Explicitly produce an unsigned development `.bampack` bundle.
+        #[arg(long, conflicts_with = "key")]
+        dev: bool,
     },
-    /// Watch guest mod sources/manifests, rebuild incrementally on change, sign, and atomically stage for hot-reload.
+    /// Watch guest mod sources/manifests via `notify` + mtime gating, rebuild incrementally, sign, and atomically stage for hot-reload.
     Watch {
         /// Project directory containing `mod.toml` / `Cargo.toml`.
         #[arg(long)]
@@ -496,7 +214,7 @@ enum Commands {
         /// `SSHSIG` namespace used when `--key` is passed.
         #[arg(long, default_value = signing::DEFAULT_NAMESPACE)]
         namespace: String,
-        /// Polling interval in milliseconds for recursive source/manifest fingerprinting.
+        /// Fallback check / `notify` wait interval in milliseconds.
         #[arg(long, default_value_t = watch::DEFAULT_POLL_MS)]
         poll_ms: u64,
         /// Run a single build/sign/stage cycle and exit.
@@ -511,7 +229,7 @@ enum Commands {
         /// Mods directory containing `mod.toml` or `<mod>/mod.toml` subdirectories.
         dir: PathBuf,
     },
-    /// Diagnose host ABI `0.3.0` layout, Rust/MSVC/Clang/GCC/Zig toolchains, SDK header parity, and optional mods directory.
+    /// Diagnose host ABI `0.4.0` layout, Rust/MSVC/Clang/GCC/Zig toolchains, SDK header parity, and optional mods directory.
     Doctor {
         /// Optional mods directory to validate during the diagnostic pass.
         #[arg(long)]
@@ -568,6 +286,22 @@ enum Commands {
     },
 }
 
+fn parse_target_artifact_arg(raw: &str) -> Result<(String, PathBuf), CliError> {
+    let Some((triple, path)) = raw.split_once('=') else {
+        return Err(CliError::InvalidArgument(format!(
+            "--target-artifact must use `<triple>=<path>` format, got {raw:?}"
+        )));
+    };
+    let triple = triple.trim();
+    let path = path.trim();
+    if triple.is_empty() || path.is_empty() {
+        return Err(CliError::InvalidArgument(format!(
+            "--target-artifact must have non-empty triple and path, got {raw:?}"
+        )));
+    }
+    Ok((triple.to_owned(), PathBuf::from(path)))
+}
+
 fn normalize_cargo_subcommand_args<I, T>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = T>,
@@ -610,6 +344,7 @@ where
             guest_sdk_path,
             guest_sdk_git,
         } => {
+            let lang: ModLanguage = lang.into();
             let created = scaffold::scaffold_new_mod_with_git(
                 &name,
                 lang,
@@ -632,15 +367,17 @@ where
             out_dir,
             sign_key,
             sign_namespace,
+            target,
         } => {
-            let out = builder::build_mod_with_signing(
-                manifest_path.as_deref(),
-                dir.as_deref(),
+            let out = builder::build_mod_with_options(&builder::BuildOptions {
+                manifest_path: manifest_path.as_deref(),
+                dir: dir.as_deref(),
                 release,
-                out_dir.as_deref(),
-                sign_key.as_deref(),
-                &sign_namespace,
-            )?;
+                out_dir: out_dir.as_deref(),
+                sign_key: sign_key.as_deref(),
+                sign_namespace: &sign_namespace,
+                target: target.as_deref(),
+            })?;
             println!(
                 "Built {} mod library at {}",
                 out.language,
@@ -661,7 +398,18 @@ where
             namespace,
             assets_dir,
             skip_build,
+            target_artifacts,
+            dev,
         } => {
+            let mut parsed_targets = BTreeMap::new();
+            for raw in target_artifacts {
+                let (triple, path) = parse_target_artifact_arg(&raw)?;
+                if parsed_targets.insert(triple.clone(), path).is_some() {
+                    return Err(CliError::InvalidArgument(format!(
+                        "duplicate --target-artifact entry for '{triple}'"
+                    )));
+                }
+            }
             let opts = pack::PackOptions {
                 manifest_path,
                 dir,
@@ -672,6 +420,9 @@ where
                 namespace,
                 assets_dir,
                 skip_build,
+                target_artifacts: parsed_targets,
+                include_targets: true,
+                dev_unsigned: dev,
             };
             let res = pack::pack_mod(&opts)?;
             println!(
@@ -689,7 +440,9 @@ where
                     res.namespace
                 );
             } else {
-                println!("  signed:    no (pass `--key <ed25519_key>` to sign)");
+                println!(
+                    "  signed:    no (unsigned dev bundle; pass `--key <ed25519_key>` to sign)"
+                );
             }
             Ok(())
         }

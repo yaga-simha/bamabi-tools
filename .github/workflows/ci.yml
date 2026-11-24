@@ -51,6 +51,7 @@ jobs:
           for crate_root in \
             crates/bamabi_trust/src/lib.rs \
             crates/bamabi_manifest/src/lib.rs \
+            crates/bamabi_build/src/lib.rs \
             crates/cargo-bam/src/lib.rs \
             crates/cargo-bam/src/main.rs; do
             if ! grep -q '#!\[forbid(unsafe_code)\]' "$crate_root"; then
@@ -80,6 +81,7 @@ jobs:
             fi
           fi
           cargo test -p bamabi_trust --no-default-features
+          cargo test -p bamabi_build --no-default-features
           cargo test --workspace --all-features
           cargo test --doc --all-features
           cargo run -p cargo-bam -- doctor --require-c

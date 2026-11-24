@@ -766,12 +766,12 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
 
     fs::write(
         mods_dir.join("core/mod.toml"),
-        "[mod]\nid = \"core\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"core\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     fs::write(
         mods_dir.join("expansion/mod.toml"),
-        "[mod]\nid = \"expansion\"\nversion = \"1.2.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\ncore = \"^1.0\"\n",
+        "[mod]\nid = \"expansion\"\nversion = \"1.2.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\ncore = \"^1.0\"\n",
     )
     .unwrap();
 
@@ -798,8 +798,8 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
         bamabi_sys::BAM_HOST_API_SLOT_COUNT
     );
     for needle in [
-        "0.3.0",
-        "0x00030000",
+        "0.4.0",
+        "0x00040000",
         expected_slots_needle.as_str(),
         expected_size_needle.as_str(),
         "[ok] cargo:",
@@ -836,7 +836,7 @@ fn e2e_doctor_cli_reports_toolchains_abi_layout_sdk_parity_and_dag_health() {
     );
     let bad_stderr = String::from_utf8_lossy(&bad_out.stderr);
     assert!(
-        bad_stderr.contains("0.3.0"),
+        bad_stderr.contains("0.4.0"),
         "expected ABI mismatch message in stderr, got: {bad_stderr}"
     );
 }

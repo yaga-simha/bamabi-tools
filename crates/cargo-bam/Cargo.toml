@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Safe (`#![forbid(unsafe_code)]`) CLI toolchain (`new`, `export-sdk`, `build`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`) for `bamabi`"
+description = "Safe (`#![forbid(unsafe_code)]`) CLI toolchain (`new`, `export-sdk`, `build`, `pack`, `watch`, `check-mods`, `doctor`, `keygen`, `sign`, `verify`) for `bamabi`"
 readme = "README.md"
 repository.workspace = true
 keywords.workspace = true
@@ -23,16 +23,14 @@ name = "cargo-bam"
 path = "src/main.rs"
 
 [dependencies]
+bamabi_build = { workspace = true, features = ["keygen"] }
 bamabi_sys = { workspace = true }
 bamabi_manifest = { workspace = true }
 bamabi_sdk_gen = { workspace = true }
 bamabi_trust = { workspace = true, features = ["keygen"] }
 clap = { workspace = true }
-semver = { workspace = true }
-serde = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
-toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+toml = { workspace = true }

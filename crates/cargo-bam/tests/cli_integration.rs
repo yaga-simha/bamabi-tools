@@ -255,7 +255,7 @@ fn cli_new_rust_template_has_no_path_leak_and_uses_zero_boilerplate_api() {
         Some("main")
     );
     assert!(mod_toml.contains("version = \"0.1.0\""));
-    assert!(mod_toml.contains("abi_version = \"0.3.0\""));
+    assert!(mod_toml.contains("abi_version = \"0.4.0\""));
 
     // Explicit `--guest-sdk-path` formatting & TOML validity
     run_cli([
@@ -446,12 +446,12 @@ fn cli_check_mods_validates_dag_semver_mismatch_and_cycles() {
 
     fs::write(
         mods_dir.join("base/mod.toml"),
-        "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"base\"\nversion = \"1.2.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
     fs::write(
         mods_dir.join("addon/mod.toml"),
-        "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.3.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
+        "[mod]\nid = \"addon\"\nversion = \"1.0.0\"\nabi_version = \"^0.4.0\"\n\n[dependencies]\nbase = \"^1.0\"\n",
     )
     .unwrap();
     fs::write(
@@ -525,7 +525,7 @@ fn cli_header_alias_and_doctor_validate_environment_and_mods() {
     fs::create_dir_all(mods_dir.join("core")).unwrap();
     fs::write(
         mods_dir.join("core/mod.toml"),
-        "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.3.0\"\n",
+        "[mod]\nid = \"core\"\nversion = \"0.2.0\"\nabi_version = \"^0.4.0\"\n",
     )
     .unwrap();
 
@@ -533,7 +533,7 @@ fn cli_header_alias_and_doctor_validate_environment_and_mods() {
 
     let report = doctor::run_doctor(Some(&mods_dir), false).unwrap();
     assert!(report.ok);
-    assert_eq!(report.host_abi_version, "0.3.0");
+    assert_eq!(report.host_abi_version, "0.4.0");
     assert!(
         report
             .tools
@@ -561,8 +561,8 @@ fn cli_header_alias_and_doctor_validate_environment_and_mods() {
     .unwrap();
     let err = run_cli(["cargo-bam", "doctor", "--dir", mods_dir.to_str().unwrap()]).unwrap_err();
     assert!(
-        err.to_string().contains("0.3.0"),
-        "expected ABI compatibility error mentioning 0.3.0, got: {err}"
+        err.to_string().contains("0.4.0"),
+        "expected ABI compatibility error mentioning 0.4.0, got: {err}"
     );
 }
 
@@ -766,4 +766,46 @@ fn cli_verify_supports_krl_revocation_for_loose_libs_and_bampacks() {
         ])
         .is_err()
     );
+}
+
+#[test]
+fn cli_pack_supports_dev_unsigned_and_target_artifact_flags() {
+    let tmp = TempDir::new().unwrap();
+    let proj = tmp.path().join("cli_multi");
+    fs::create_dir_all(&proj).unwrap();
+    let linux_so = tmp.path().join("libcli_multi_linux.so");
+    let win_dll = tmp.path().join("cli_multi_win.dll");
+    fs::write(&linux_so, b"\x7fELF-linux").unwrap();
+    fs::write(&win_dll, b"MZ-windows").unwrap();
+
+    fs::write(
+        proj.join("mod.toml"),
+        "[mod]\nid = \"cli_multi\"\nversion = \"0.4.0\"\nlanguage = \"c99\"\n\n[targets.x86_64-unknown-linux-gnu]\nentry = \"bin/linux/libcli_multi.so\"\n",
+    )
+    .unwrap();
+
+    let out_pack = tmp.path().join("cli_multi_dev.bampack");
+    run_cli([
+        "cargo-bam",
+        "pack",
+        "--dir",
+        proj.to_str().unwrap(),
+        "--skip-build",
+        "--dev",
+        "--target-artifact",
+        &format!("x86_64-unknown-linux-gnu={}", linux_so.display()),
+        "--target-artifact",
+        &format!("x86_64-pc-windows-msvc={}", win_dll.display()),
+        "--out",
+        out_pack.to_str().unwrap(),
+    ])
+    .unwrap();
+
+    let bytes = fs::read(&out_pack).unwrap();
+    let (entries, has_sig) = pack::inspect_bampack_entries(&bytes).unwrap();
+    assert!(!has_sig);
+    let paths: Vec<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"bin/linux/libcli_multi.so"));
+    assert!(paths.contains(&"bin/x86_64-pc-windows-msvc/cli_multi_win.dll"));
+    assert!(paths.contains(&"mod.toml"));
 }

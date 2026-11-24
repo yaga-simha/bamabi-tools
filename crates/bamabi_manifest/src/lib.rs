@@ -9,15 +9,25 @@
 //!
 //! ## Core Components
 //!
-//! - [`ModTomlManifest`]: Bounded `mod.toml` parser with host ABI `0.3.0` SemVer compatibility
-//!   validation against [`bamabi_sys`].
+//! - [`ModTomlManifest`]: Bounded `mod.toml` parser, serializer, builder, and host ABI SemVer
+//!   compatibility validator against [`bamabi_sys`].
+//! - [`AbiLockManifest`]: Canonical `abi-lock.toml` + `Cargo.lock` + `bamabi_sys::ABI_VERSION` +
+//!   `bevy_version` parity validator reusable across all federated `xtask` crates.
 //! - [`validate_mod_id`] & [`validate_manifest_entry_path`]: Lexical and anti-symlink path
 //!   confinement guards rejecting traversal, control bytes, NTFS streams, and Windows reserved names.
 //! - [`resolve_dependency_dag`] & [`ManifestDagResolution`]: Deterministic Kahn topological
 //!   load-order sorter for required and optional SemVer mod dependencies.
 
+pub mod abi_lock;
+
+pub use abi_lock::{
+    AbiLockAbi, AbiLockError, AbiLockManifest, AbiLockProject, AbiLockValidationReport,
+    CANONICAL_WIRE_GIT_URL, CANONICAL_WIRE_LOCK_SOURCE_PREFIX, CargoLockParityReport,
+    WireLockSource,
+};
+
 use bamabi_sys::{ABI_VERSION_MAJOR, ABI_VERSION_MINOR, ABI_VERSION_PATCH};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::io::Read;
@@ -165,6 +175,97 @@ fn permission_denied(path: PathBuf, detail: impl Into<String>) -> ManifestError 
     }
 }
 
+/// Validates a `[targets.<triple>]` target triple identifier (e.g. `"x86_64-unknown-linux-gnu"`).
+pub fn validate_target_triple(triple: &str) -> Result<(), String> {
+    if triple.is_empty() {
+        return Err("target triple must not be empty".to_owned());
+    }
+    if triple.len() > MAX_MOD_ID_LEN {
+        return Err(format!(
+            "target triple length ({}) exceeds maximum ({MAX_MOD_ID_LEN})",
+            triple.len()
+        ));
+    }
+    if triple.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err("target triple must not contain NUL or ASCII control characters".to_owned());
+    }
+    if triple.starts_with('-') || triple.starts_with('.') || triple.contains("..") {
+        return Err("target triple must not start with '-' or '.' or contain '..'".to_owned());
+    }
+    if !triple
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        return Err(
+            "target triple may only contain ASCII letters, digits, '_', '-', or '.'".to_owned(),
+        );
+    }
+    Ok(())
+}
+
+/// Validates a `[capabilities]` capability, permission, or flag identifier.
+pub fn validate_capability_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("capability identifier must not be empty".to_owned());
+    }
+    if name.len() > MAX_MOD_ID_LEN {
+        return Err(format!(
+            "capability identifier length ({}) exceeds maximum ({MAX_MOD_ID_LEN})",
+            name.len()
+        ));
+    }
+    if name.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(
+            "capability identifier must not contain NUL or ASCII control characters".to_owned(),
+        );
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(
+            "capability identifier may only contain ASCII letters, digits, '_', '-', '.', or ':'"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_relative_subpath(raw: &str, label: &str) -> Result<(), String> {
+    if raw.is_empty() {
+        return Err(format!("{label} must not be empty"));
+    }
+    if raw.len() > MAX_ENTRY_PATH_LEN {
+        return Err(format!(
+            "{label} length ({}) exceeds maximum ({MAX_ENTRY_PATH_LEN})",
+            raw.len()
+        ));
+    }
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7F) {
+        return Err(format!(
+            "{label} must not contain NUL or ASCII control characters"
+        ));
+    }
+    if raw.starts_with('/') || raw.contains('\\') || raw.contains(':') {
+        return Err(format!(
+            "{label} must be a relative POSIX path without '\\' or ':'"
+        ));
+    }
+    for seg in raw.split('/') {
+        if seg.is_empty() || seg == ".." {
+            return Err(format!("{label} contains invalid segment '{seg}'"));
+        }
+    }
+    Ok(())
+}
+
+fn validate_sha256_hex(raw: &str) -> Result<(), String> {
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("sha256 digest must be exactly 64 hexadecimal characters".to_owned());
+    }
+    Ok(())
+}
+
 /// Host ABI SemVer version derived from [`bamabi_sys::ABI_VERSION`].
 #[inline]
 #[must_use]
@@ -176,35 +277,142 @@ pub fn host_abi_semver() -> semver::Version {
     )
 }
 
-#[derive(Debug, Deserialize)]
+/// Target-specific entry configuration under `[targets.<triple>]` in `mod.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModTargetConfig {
+    /// Relative POSIX path to the target shared library inside the mod directory / `.bampack`.
+    pub entry: String,
+    /// Optional expected lowercase SHA-256 hex digest for the target binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+}
+
+impl ModTargetConfig {
+    /// Creates a target entry configuration for `entry`.
+    #[must_use]
+    pub fn new(entry: impl Into<String>) -> Self {
+        Self {
+            entry: entry.into(),
+            sha256: None,
+        }
+    }
+
+    /// Attaches an optional expected SHA-256 hex digest.
+    #[must_use]
+    pub fn with_sha256(mut self, sha256: impl Into<String>) -> Self {
+        self.sha256 = Some(sha256.into());
+        self
+    }
+}
+
+/// Custom build configuration under `[build]` in `mod.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModBuildConfig {
+    /// Optional custom build command executed by `bamabi_build` / `cargo bam build`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Optional explicit argument list passed to [`Self::command`] without shell expansion.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Optional relative working directory inside the mod project root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_dir: Option<String>,
+    /// Optional relative POSIX path to the produced shared library artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    /// Extra environment variables injected when executing [`Self::command`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    /// Additional relative paths watched by `cargo bam watch`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub watch_paths: Vec<String>,
+}
+
+impl ModBuildConfig {
+    /// Creates a [`ModBuildConfig`] executing `command`.
+    #[must_use]
+    pub fn with_command(command: impl Into<String>) -> Self {
+        Self {
+            command: Some(command.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Returns `true` when all fields are unset / empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.command.is_none()
+            && self.args.is_empty()
+            && self.working_dir.is_none()
+            && self.output.is_none()
+            && self.env.is_empty()
+            && self.watch_paths.is_empty()
+    }
+}
+
+/// Declarative host capability and permission requirements under `[capabilities]` in `mod.toml`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModCapabilities {
+    /// Host capabilities required by this mod.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub required: BTreeSet<String>,
+    /// Host capabilities optionally used by this mod.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub optional: BTreeSet<String>,
+    /// Named permissions requested by this mod.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub permissions: BTreeSet<String>,
+    /// Boolean capability flags.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub flags: BTreeMap<String, bool>,
+}
+
+impl ModCapabilities {
+    /// Returns `true` when no capabilities, permissions, or flags are declared.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.required.is_empty()
+            && self.optional.is_empty()
+            && self.permissions.is_empty()
+            && self.flags.is_empty()
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct RawModToml {
     #[serde(rename = "mod")]
     mod_section: RawModSection,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     dependencies: BTreeMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     optional_dependencies: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    targets: BTreeMap<String, ModTargetConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build: Option<ModBuildConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    capabilities: Option<ModCapabilities>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct RawModSection {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     name: Option<String>,
     version: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     abi_version: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     entry: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     library: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     language: Option<String>,
 }
 
 /// Parsed declarative `mod.toml` manifest with validated SemVer version and dependency bounds.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ModTomlManifest {
     /// Canonical mod identifier (`[mod].id` if present, otherwise `[mod].name`).
     pub name: String,
@@ -222,16 +430,424 @@ pub struct ModTomlManifest {
     pub dependencies: BTreeMap<String, semver::VersionReq>,
     /// Optional dependencies (`<mod_name> = "<semver_req>"`).
     pub optional_dependencies: BTreeMap<String, semver::VersionReq>,
+    /// Optional per-target shared-library entries (`[targets.<triple>]`).
+    pub targets: BTreeMap<String, ModTargetConfig>,
+    /// Optional custom build configuration (`[build]`).
+    pub build: Option<ModBuildConfig>,
+    /// Optional declarative capability and permission metadata (`[capabilities]`).
+    pub capabilities: Option<ModCapabilities>,
     /// Filesystem path of the parsed `mod.toml`.
     pub manifest_path: PathBuf,
 }
 
+/// Fluent builder for constructing validated [`ModTomlManifest`] instances.
+#[derive(Clone, Debug, Serialize)]
+pub struct ModTomlManifestBuilder {
+    id: String,
+    display_name: Option<String>,
+    version: semver::Version,
+    abi_version: Option<semver::VersionReq>,
+    entry: Option<String>,
+    language: Option<String>,
+    dependencies: BTreeMap<String, semver::VersionReq>,
+    optional_dependencies: BTreeMap<String, semver::VersionReq>,
+    targets: BTreeMap<String, ModTargetConfig>,
+    build: Option<ModBuildConfig>,
+    capabilities: Option<ModCapabilities>,
+    manifest_path: PathBuf,
+}
+
+impl ModTomlManifestBuilder {
+    /// Sets the optional human-readable display name (`[mod].name`).
+    #[must_use]
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    /// Sets the optional host ABI SemVer requirement (`[mod].abi_version`).
+    #[must_use]
+    pub fn abi_version(mut self, req: semver::VersionReq) -> Self {
+        self.abi_version = Some(req);
+        self
+    }
+
+    /// Sets the optional entry shared-library path (`[mod].entry`).
+    #[must_use]
+    pub fn entry(mut self, entry: impl Into<String>) -> Self {
+        self.entry = Some(entry.into());
+        self
+    }
+
+    /// Sets the optional guest language identifier (`[mod].language`).
+    #[must_use]
+    pub fn language(mut self, language: impl Into<String>) -> Self {
+        self.language = Some(language.into());
+        self
+    }
+
+    /// Adds a required dependency constraint (`[dependencies]`).
+    #[must_use]
+    pub fn dependency(mut self, mod_id: impl Into<String>, req: semver::VersionReq) -> Self {
+        self.dependencies.insert(mod_id.into(), req);
+        self
+    }
+
+    /// Adds an optional dependency constraint (`[optional_dependencies]`).
+    #[must_use]
+    pub fn optional_dependency(
+        mut self,
+        mod_id: impl Into<String>,
+        req: semver::VersionReq,
+    ) -> Self {
+        self.optional_dependencies.insert(mod_id.into(), req);
+        self
+    }
+
+    /// Adds a target-specific entry (`[targets.<triple>]`).
+    #[must_use]
+    pub fn target(mut self, triple: impl Into<String>, target: ModTargetConfig) -> Self {
+        self.targets.insert(triple.into(), target);
+        self
+    }
+
+    /// Sets the `[build]` section.
+    #[must_use]
+    pub fn build_config(mut self, build: ModBuildConfig) -> Self {
+        self.build = Some(build);
+        self
+    }
+
+    /// Sets the `[capabilities]` section.
+    #[must_use]
+    pub fn capabilities(mut self, capabilities: ModCapabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// Sets the filesystem path associated with this manifest (defaults to `"mod.toml"`).
+    #[must_use]
+    pub fn manifest_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.manifest_path = path.into();
+        self
+    }
+
+    /// Validates all fields and constructs a [`ModTomlManifest`].
+    pub fn build(self) -> Result<ModTomlManifest, ManifestError> {
+        let manifest = ModTomlManifest {
+            name: self.id,
+            display_name: self.display_name,
+            version: self.version,
+            abi_version: self.abi_version,
+            entry: self.entry,
+            language: self.language,
+            dependencies: self.dependencies,
+            optional_dependencies: self.optional_dependencies,
+            targets: self.targets,
+            build: self.build,
+            capabilities: self.capabilities,
+            manifest_path: self.manifest_path,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+}
+
+fn validate_build_config(build: &ModBuildConfig, path: &Path) -> Result<(), ManifestError> {
+    if let Some(ref cmd) = build.command {
+        if cmd.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(invalid_manifest_input(
+                path.to_path_buf(),
+                "[build].command must not contain NUL or ASCII control characters",
+            ));
+        }
+        if cmd.trim().is_empty() {
+            return Err(invalid_manifest_input(
+                path.to_path_buf(),
+                "[build].command must not be empty",
+            ));
+        }
+    }
+    for arg in &build.args {
+        if arg.bytes().any(|b| b < 0x20 || b == 0x7F) {
+            return Err(invalid_manifest_input(
+                path.to_path_buf(),
+                "[build].args must not contain NUL or ASCII control characters",
+            ));
+        }
+    }
+    if let Some(ref wd) = build.working_dir
+        && let Err(reason) = validate_relative_subpath(wd, "[build].working_dir")
+    {
+        return Err(invalid_manifest_input(path.to_path_buf(), reason));
+    }
+    if let Some(ref out) = build.output
+        && let Err(reason) = validate_manifest_entry_path(out)
+    {
+        return Err(invalid_manifest_input(
+            path.to_path_buf(),
+            format!("invalid [build].output '{out}': {reason}"),
+        ));
+    }
+    for (k, v) in &build.env {
+        if k.is_empty()
+            || k.contains('=')
+            || k.bytes().any(|b| b < 0x20 || b == 0x7F)
+            || v.bytes().any(|b| b < 0x20 || b == 0x7F)
+        {
+            return Err(invalid_manifest_input(
+                path.to_path_buf(),
+                format!("invalid [build].env entry '{k}'"),
+            ));
+        }
+    }
+    for wp in &build.watch_paths {
+        if let Err(reason) = validate_relative_subpath(wp, "[build].watch_paths") {
+            return Err(invalid_manifest_input(path.to_path_buf(), reason));
+        }
+    }
+    Ok(())
+}
+
+fn validate_capabilities(caps: &ModCapabilities, path: &Path) -> Result<(), ManifestError> {
+    for cap in caps
+        .required
+        .iter()
+        .chain(caps.optional.iter())
+        .chain(caps.permissions.iter())
+        .chain(caps.flags.keys())
+    {
+        if let Err(reason) = validate_capability_name(cap) {
+            return Err(invalid_manifest_input(
+                path.to_path_buf(),
+                format!("invalid capability '{cap}': {reason}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn host_target_triple_candidates() -> &'static [&'static str] {
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "gnu"))]
+    {
+        &["x86_64-unknown-linux-gnu"]
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "linux", target_env = "musl"))]
+    {
+        &["x86_64-unknown-linux-musl", "x86_64-unknown-linux-gnu"]
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "gnu"))]
+    {
+        &["aarch64-unknown-linux-gnu"]
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "linux", target_env = "musl"))]
+    {
+        &["aarch64-unknown-linux-musl", "aarch64-unknown-linux-gnu"]
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
+    {
+        &["x86_64-apple-darwin"]
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    {
+        &["aarch64-apple-darwin"]
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "msvc"))]
+    {
+        &["x86_64-pc-windows-msvc", "x86_64-pc-windows-gnu"]
+    }
+    #[cfg(all(target_arch = "x86_64", target_os = "windows", target_env = "gnu"))]
+    {
+        &["x86_64-pc-windows-gnu", "x86_64-pc-windows-msvc"]
+    }
+    #[cfg(all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"))]
+    {
+        &["aarch64-pc-windows-msvc"]
+    }
+    #[cfg(not(any(
+        all(
+            target_arch = "x86_64",
+            target_os = "linux",
+            any(target_env = "gnu", target_env = "musl")
+        ),
+        all(
+            target_arch = "aarch64",
+            target_os = "linux",
+            any(target_env = "gnu", target_env = "musl")
+        ),
+        all(target_arch = "x86_64", target_os = "macos"),
+        all(target_arch = "aarch64", target_os = "macos"),
+        all(
+            target_arch = "x86_64",
+            target_os = "windows",
+            any(target_env = "msvc", target_env = "gnu")
+        ),
+        all(target_arch = "aarch64", target_os = "windows", target_env = "msvc"),
+    )))]
+    {
+        &[]
+    }
+}
+
 impl ModTomlManifest {
+    /// Returns a fluent [`ModTomlManifestBuilder`] for constructing a validated manifest.
+    #[must_use]
+    pub fn builder(id: impl Into<String>, version: semver::Version) -> ModTomlManifestBuilder {
+        ModTomlManifestBuilder {
+            id: id.into(),
+            display_name: None,
+            version,
+            abi_version: None,
+            entry: None,
+            language: None,
+            dependencies: BTreeMap::new(),
+            optional_dependencies: BTreeMap::new(),
+            targets: BTreeMap::new(),
+            build: None,
+            capabilities: None,
+            manifest_path: PathBuf::from("mod.toml"),
+        }
+    }
+
     /// Canonical mod identifier (`[mod].id` if present, otherwise `[mod].name`).
     #[inline]
     #[must_use]
     pub fn id(&self) -> &str {
         &self.name
+    }
+
+    /// Validates all identifiers, entry paths, targets, build configuration, and capabilities.
+    pub fn validate(&self) -> Result<(), ManifestError> {
+        let path = &self.manifest_path;
+        if let Err(reason) = validate_mod_id(&self.name) {
+            return Err(invalid_manifest_input(
+                path.clone(),
+                format!("invalid [mod].id '{}': {reason}", self.name),
+            ));
+        }
+        if let Some(ref disp) = self.display_name
+            && disp.bytes().any(|b| b < 0x20 || b == 0x7F)
+        {
+            return Err(invalid_manifest_input(
+                path.clone(),
+                "[mod].name must not contain NUL or ASCII control characters",
+            ));
+        }
+        if let Some(ref entry) = self.entry
+            && let Err(reason) = validate_manifest_entry_path(entry)
+        {
+            return Err(invalid_manifest_input(
+                path.clone(),
+                format!("invalid [mod].entry '{entry}': {reason}"),
+            ));
+        }
+        if let Some(ref lang) = self.language
+            && lang.bytes().any(|b| b < 0x20 || b == 0x7F)
+        {
+            return Err(invalid_manifest_input(
+                path.clone(),
+                "[mod].language must not contain NUL or ASCII control characters",
+            ));
+        }
+        for dep in self
+            .dependencies
+            .keys()
+            .chain(self.optional_dependencies.keys())
+        {
+            if let Err(reason) = validate_mod_id(dep) {
+                return Err(invalid_manifest_input(
+                    path.clone(),
+                    format!("invalid dependency identifier '{dep}': {reason}"),
+                ));
+            }
+        }
+        for (triple, target) in &self.targets {
+            if let Err(reason) = validate_target_triple(triple) {
+                return Err(invalid_manifest_input(
+                    path.clone(),
+                    format!("invalid [targets.{triple}]: {reason}"),
+                ));
+            }
+            if let Err(reason) = validate_manifest_entry_path(&target.entry) {
+                return Err(invalid_manifest_input(
+                    path.clone(),
+                    format!(
+                        "invalid [targets.{triple}].entry '{}': {reason}",
+                        target.entry
+                    ),
+                ));
+            }
+            if let Some(ref sha) = target.sha256
+                && let Err(reason) = validate_sha256_hex(sha)
+            {
+                return Err(invalid_manifest_input(
+                    path.clone(),
+                    format!("invalid [targets.{triple}].sha256: {reason}"),
+                ));
+            }
+        }
+        if let Some(ref build) = self.build {
+            validate_build_config(build, path)?;
+        }
+        if let Some(ref caps) = self.capabilities {
+            validate_capabilities(caps, path)?;
+        }
+        Ok(())
+    }
+
+    /// Serializes this manifest into a canonical `mod.toml` TOML document string.
+    pub fn to_toml_string(&self) -> Result<String, ManifestError> {
+        self.validate()?;
+        let dependencies = self
+            .dependencies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        let optional_dependencies = self
+            .optional_dependencies
+            .iter()
+            .map(|(k, v)| (k.clone(), v.to_string()))
+            .collect();
+        let build = self.build.clone().filter(|b| !b.is_empty());
+        let capabilities = self.capabilities.clone().filter(|c| !c.is_empty());
+        let raw = RawModToml {
+            mod_section: RawModSection {
+                id: Some(self.name.clone()),
+                name: self.display_name.clone(),
+                version: self.version.to_string(),
+                abi_version: self.abi_version.as_ref().map(ToString::to_string),
+                entry: self.entry.clone(),
+                library: None,
+                language: self.language.clone(),
+            },
+            dependencies,
+            optional_dependencies,
+            targets: self.targets.clone(),
+            build,
+            capabilities,
+        };
+        toml::to_string_pretty(&raw).map_err(|err| {
+            invalid_manifest_input(
+                self.manifest_path.clone(),
+                format!("failed to serialize mod.toml: {err}"),
+            )
+        })
+    }
+
+    /// Alias for [`Self::to_toml_string`].
+    #[inline]
+    pub fn to_toml(&self) -> Result<String, ManifestError> {
+        self.to_toml_string()
+    }
+
+    /// Returns the declared entry path for `target_triple` (`[targets.<triple>].entry`), falling
+    /// back to `[mod].entry` when no target-specific entry is present.
+    #[must_use]
+    pub fn entry_for_target(&self, target_triple: &str) -> Option<&str> {
+        self.targets
+            .get(target_triple)
+            .map(|t| t.entry.as_str())
+            .or(self.entry.as_deref())
     }
 
     /// Parses and SemVer-validates a `mod.toml` document from `toml_str`.
@@ -367,6 +983,46 @@ impl ModTomlManifest {
             optional_dependencies.insert(dep, req);
         }
 
+        let mut targets = BTreeMap::new();
+        for (triple, mut target) in raw.targets {
+            if let Err(reason) = validate_target_triple(&triple) {
+                return Err(invalid_manifest_input(
+                    path,
+                    format!("invalid [targets.{triple}]: {reason}"),
+                ));
+            }
+            if let Err(reason) = validate_manifest_entry_path(&target.entry) {
+                return Err(invalid_manifest_input(
+                    path,
+                    format!(
+                        "invalid [targets.{triple}].entry '{}': {reason}",
+                        target.entry
+                    ),
+                ));
+            }
+            if let Some(ref mut sha) = target.sha256 {
+                let normalized = sha.trim().to_ascii_lowercase();
+                if let Err(reason) = validate_sha256_hex(&normalized) {
+                    return Err(invalid_manifest_input(
+                        path,
+                        format!("invalid [targets.{triple}].sha256: {reason}"),
+                    ));
+                }
+                *sha = normalized;
+            }
+            targets.insert(triple, target);
+        }
+
+        let build = raw.build.filter(|b| !b.is_empty());
+        if let Some(ref b) = build {
+            validate_build_config(b, &path)?;
+        }
+
+        let capabilities = raw.capabilities.filter(|c| !c.is_empty());
+        if let Some(ref caps) = capabilities {
+            validate_capabilities(caps, &path)?;
+        }
+
         Ok(Self {
             name,
             display_name,
@@ -376,6 +1032,9 @@ impl ModTomlManifest {
             language,
             dependencies,
             optional_dependencies,
+            targets,
+            build,
+            capabilities,
             manifest_path: path,
         })
     }
@@ -441,9 +1100,13 @@ impl ModTomlManifest {
         Ok(())
     }
 
-    /// Resolves the shared-library path for this manifest relative to `manifest_path.parent()`,
-    /// rejecting path traversal, unsafe identifiers, symlinks, and escapes outside the mod root.
-    pub fn resolve_library_path(&self) -> Result<PathBuf, ManifestError> {
+    /// Resolves the shared-library path for `target_triple` (or host defaults when `None`)
+    /// relative to `manifest_path.parent()`, rejecting path traversal, unsafe identifiers,
+    /// symlinks, and escapes outside the mod root.
+    pub fn resolve_library_path_for_target(
+        &self,
+        target_triple: Option<&str>,
+    ) -> Result<PathBuf, ManifestError> {
         if let Err(reason) = validate_mod_id(&self.name) {
             return Err(invalid_manifest_input(
                 self.manifest_path.clone(),
@@ -457,6 +1120,22 @@ impl ModTomlManifest {
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
 
+        if let Some(triple) = target_triple
+            && let Some(target_cfg) = self.targets.get(triple)
+        {
+            if let Err(reason) = validate_manifest_entry_path(&target_cfg.entry) {
+                return Err(invalid_manifest_input(
+                    self.manifest_path.clone(),
+                    format!(
+                        "invalid [targets.{triple}].entry '{}': {reason}",
+                        target_cfg.entry
+                    ),
+                ));
+            }
+            let segments: Vec<&str> = target_cfg.entry.split('/').collect();
+            return resolve_confined_regular_file(base_dir, &segments, &self.name);
+        }
+
         if let Some(ref entry) = self.entry {
             if let Err(reason) = validate_manifest_entry_path(entry) {
                 return Err(invalid_manifest_input(
@@ -466,6 +1145,26 @@ impl ModTomlManifest {
             }
             let segments: Vec<&str> = entry.split('/').collect();
             return resolve_confined_regular_file(base_dir, &segments, &self.name);
+        }
+
+        for candidate_triple in host_target_triple_candidates() {
+            if let Some(target_cfg) = self.targets.get(*candidate_triple) {
+                if let Err(reason) = validate_manifest_entry_path(&target_cfg.entry) {
+                    return Err(invalid_manifest_input(
+                        self.manifest_path.clone(),
+                        format!(
+                            "invalid [targets.{candidate_triple}].entry '{}': {reason}",
+                            target_cfg.entry
+                        ),
+                    ));
+                }
+                let segments: Vec<&str> = target_cfg.entry.split('/').collect();
+                match resolve_confined_regular_file(base_dir, &segments, &self.name) {
+                    Ok(p) => return Ok(p),
+                    Err(ManifestError::MissingLibrary { .. }) => {}
+                    Err(err) => return Err(err),
+                }
+            }
         }
 
         let ext = std::env::consts::DLL_EXTENSION;
@@ -527,6 +1226,12 @@ impl ModTomlManifest {
             mod_name: self.name.clone(),
             path: base_dir.join(preferred_prefixed_name),
         })
+    }
+
+    /// Resolves the shared-library path for this manifest relative to `manifest_path.parent()`,
+    /// rejecting path traversal, unsafe identifiers, symlinks, and escapes outside the mod root.
+    pub fn resolve_library_path(&self) -> Result<PathBuf, ManifestError> {
+        self.resolve_library_path_for_target(None)
     }
 }
 
@@ -1261,5 +1966,139 @@ debug_draw = ">=0.1.0"
 
         let strict_err = check_mods_dir_strict(dir).unwrap_err();
         assert!(matches!(strict_err, ManifestError::CycleQuarantined { .. }));
+    }
+
+    #[test]
+    fn builder_serialize_to_toml_roundtrip_with_targets_build_and_capabilities() {
+        let host = host_abi_semver();
+        let mut caps = ModCapabilities::default();
+        caps.required.insert("assets".to_owned());
+        caps.optional.insert("audio".to_owned());
+        caps.permissions.insert("fs_read".to_owned());
+        caps.flags.insert("deterministic".to_owned(), true);
+
+        let mut build = ModBuildConfig::with_command("make");
+        build.args = vec!["release".to_owned()];
+        build.working_dir = Some("native".to_owned());
+        build.output = Some("bin/libdemo.so".to_owned());
+        build.env.insert("OPT".to_owned(), "2".to_owned());
+        build.watch_paths = vec!["native/src".to_owned()];
+
+        let built = ModTomlManifest::builder("demo_mod", semver::Version::new(0, 4, 0))
+            .display_name("Demo Mod")
+            .abi_version(semver::VersionReq::parse(&format!("^{host}")).unwrap())
+            .language("c99")
+            .dependency("core_mod", semver::VersionReq::parse("^1.0").unwrap())
+            .optional_dependency("ui_mod", semver::VersionReq::parse(">=0.1.0").unwrap())
+            .target(
+                "x86_64-unknown-linux-gnu",
+                ModTargetConfig::new("bin/x86_64-unknown-linux-gnu/libdemo_mod.so")
+                    .with_sha256("a".repeat(64)),
+            )
+            .target(
+                "aarch64-apple-darwin",
+                ModTargetConfig::new("bin/aarch64-apple-darwin/libdemo_mod.dylib"),
+            )
+            .build_config(build)
+            .capabilities(caps)
+            .build()
+            .expect("builder should validate cleanly");
+
+        let toml_text = built.to_toml_string().expect("serialize mod.toml");
+        assert!(toml_text.contains("[targets.x86_64-unknown-linux-gnu]"));
+        assert!(toml_text.contains("[build]"));
+        assert!(toml_text.contains("[capabilities]"));
+
+        let reparsed = ModTomlManifest::parse_str(&toml_text, &built.manifest_path)
+            .expect("round-trip parse_str");
+        assert_eq!(reparsed, built);
+        assert_eq!(
+            reparsed.entry_for_target("aarch64-apple-darwin"),
+            Some("bin/aarch64-apple-darwin/libdemo_mod.dylib")
+        );
+
+        // Ensure `serde::Serialize` works directly on `ModTomlManifest` and nested types.
+        let as_toml_value = toml::Value::try_from(&reparsed).expect("ModTomlManifest Serialize");
+        assert_eq!(as_toml_value["name"].as_str(), Some("demo_mod"));
+    }
+
+    #[test]
+    fn resolve_library_path_for_target_resolves_target_specific_binary() {
+        let tmp = TempDir::new().unwrap();
+        let mod_dir = tmp.path().join("multi_mod");
+        let bin_linux = mod_dir.join("bin/x86_64-unknown-linux-gnu");
+        std::fs::create_dir_all(&bin_linux).unwrap();
+        let linux_lib = bin_linux.join("libmulti_mod.so");
+        std::fs::write(&linux_lib, b"elf-stub").unwrap();
+
+        let manifest = ModTomlManifest::builder("multi_mod", semver::Version::new(1, 0, 0))
+            .target(
+                "x86_64-unknown-linux-gnu",
+                ModTargetConfig::new("bin/x86_64-unknown-linux-gnu/libmulti_mod.so"),
+            )
+            .manifest_path(mod_dir.join("mod.toml"))
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            manifest
+                .resolve_library_path_for_target(Some("x86_64-unknown-linux-gnu"))
+                .unwrap(),
+            linux_lib
+        );
+    }
+
+    #[test]
+    fn abi_lock_manifest_validates_workspace_sys_cargo_lock_and_bevy_version() {
+        let ws_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let report = AbiLockManifest::validate_workspace(&ws_root, Some("0.20.1"))
+            .expect("bamabi-tools workspace abi-lock.toml must validate");
+        assert_eq!(report.abi_version, bamabi_sys::ABI_VERSION);
+
+        let lock_manifest = AbiLockManifest::from_file(ws_root.join("abi-lock.toml")).unwrap();
+        let canonical_lock = format!(
+            r#"
+[[package]]
+name = "bamabi_sys"
+version = "{}"
+source = "git+https://github.com/yaga-simha/bamabi-wire.git?branch=main#0123456789abcdef0123456789abcdef01234567"
+
+[[package]]
+name = "bevy_ecs"
+version = "{}"
+"#,
+            lock_manifest.abi.workspace_version, lock_manifest.abi.bevy_version
+        );
+        let parity = lock_manifest
+            .validate_cargo_lock_str(&canonical_lock, "Cargo.lock", Some("0.20.1"))
+            .unwrap();
+        assert_eq!(
+            parity.wire_source,
+            Some(WireLockSource::CanonicalGit {
+                rev: "0123456789abcdef0123456789abcdef01234567".to_owned()
+            })
+        );
+
+        // Wrong Bevy version in Cargo.lock fails
+        let bad_bevy_lock = r#"
+[[package]]
+name = "bevy_ecs"
+version = "0.19.0"
+"#;
+        assert!(matches!(
+            lock_manifest.validate_cargo_lock_str(bad_bevy_lock, "Cargo.lock", Some("0.20.1")),
+            Err(AbiLockError::CargoLockMismatch { .. })
+        ));
+
+        // Mismatched ABI version fails against bamabi_sys::ABI_VERSION
+        let wrong_abi = lock_manifest
+            .to_toml_string()
+            .unwrap()
+            .replace(&lock_manifest.abi.bam_abi_version, "0x0003_0000");
+        let parsed_wrong = AbiLockManifest::parse_str(&wrong_abi, "abi-lock.toml").unwrap();
+        assert!(matches!(
+            parsed_wrong.validate_abi_sys(None),
+            Err(AbiLockError::AbiVersionMismatch { .. })
+        ));
     }
 }

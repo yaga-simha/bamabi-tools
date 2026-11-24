@@ -647,6 +647,16 @@ impl BamPackBuilder {
         Ok(body)
     }
 
+    /// Serializes an unsigned development `.bampack` archive (`sig_len == 0` trailer).
+    ///
+    /// Unsigned archives can be inspected with [`parse_bampack_entries_unverified`], while
+    /// [`ModTrustPolicy::verify_bampack_bytes`] strictly rejects them.
+    pub fn build_unsigned(&self) -> Result<Vec<u8>, ModSigningError> {
+        let mut body = self.encode_unsigned_body()?;
+        body.extend_from_slice(&0u32.to_le_bytes());
+        Ok(body)
+    }
+
     /// Serializes and signs the `.bampack` archive with a raw Ed25519 private key.
     pub fn build_signed_with_key(
         &self,
@@ -982,7 +992,7 @@ mod tests {
         assert!(policy.verify_bampack_bytes(&tampered).is_err());
 
         // Revoked serial -> rejected.
-        let revoked_policy = policy.revoke_serial(55);
+        let revoked_policy = policy.clone().revoke_serial(55);
         assert!(matches!(
             revoked_policy.verify_bampack_bytes(&pack_bytes),
             Err(SignatureVerificationError::CertificateSerialRevoked { serial: 55 })
@@ -1011,5 +1021,23 @@ mod tests {
                 .add_entry("a", b"2".to_vec())
                 .is_err()
         );
+
+        // Unsigned dev bundle round-trips via `parse_bampack_entries_unverified`, rejected by policy.
+        let unsigned = BamPackBuilder::new()
+            .add_entry(
+                "mod.toml",
+                b"[mod]\nid = \"dev\"\nversion = \"0.1.0\"\n".to_vec(),
+            )
+            .unwrap()
+            .add_entry("libdev.so", vec![1, 2, 3, 4])
+            .unwrap()
+            .build_unsigned()
+            .expect("build unsigned .bampack");
+        let (parsed, has_sig) =
+            parse_bampack_entries_unverified(&unsigned, DEFAULT_MAX_BAMPACK_UNCOMPRESSED_BYTES)
+                .expect("inspect unsigned .bampack");
+        assert!(!has_sig);
+        assert_eq!(parsed.len(), 2);
+        assert!(policy.verify_bampack_bytes(&unsigned).is_err());
     }
 }
